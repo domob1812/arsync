@@ -1,0 +1,27 @@
+{
+  "name": "arsync",
+  "version": "1.0.0",
+  "description": "SQLite-backed CLI for syncing massive ArDrive drives",
+  "main": "dist/index.js",
+  "bin": {
+    "arsync": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "ardrive-core-js": "^4.0.0",
+    "arweave": "^1.15.0",
+    "better-sqlite3": "^9.4.0",
+    "commander": "^12.0.0",
+    "inquirer": "^9.2.15"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.9",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.0.0"
+  }
+}
