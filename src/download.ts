@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import Arweave from 'arweave';
 import { SyncDB } from './db';
-import { findProjectRoot } from './utils';
+import { findProjectRoot, setupDriveKey } from './utils';
 
 import { arDriveFactory, JWKWallet, deriveDriveKey, deriveFileKey, fileDecrypt } from 'ardrive-core-js';
 
@@ -137,20 +137,7 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
                 
                 // We need the drive key. Ask for password if we haven't yet.
                 if (!driveKey && wallet && arDrive) {
-                    const pwd = await askPassword();
-                    if (!pwd) throw new Error('Password required to download private file.');
-                    
-                    console.log('Deriving drive key for decryption...');
-                    const owner = await wallet.getAddress();
-                    const driveSignatureInfo = await arDrive.getDriveSignatureInfo({ driveId: driveId as any, owner });
-                    
-                    driveKey = await deriveDriveKey({
-                        dataEncryptionKey: pwd,
-                        driveId,
-                        walletPrivateKey: JSON.stringify(wallet.getPrivateKey()),
-                        driveSignatureType: driveSignatureInfo.driveSignatureType,
-                        encryptedSignatureData: driveSignatureInfo.encryptedSignatureData
-                    });
+                    driveKey = await setupDriveKey(arDrive, wallet, driveId, askPassword);
                 }
                 
                 if (!driveKey) {

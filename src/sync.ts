@@ -3,6 +3,7 @@ import { SyncDB } from './db';
 import { readFileSync } from 'fs';
 import { arDriveFactory, deriveDriveKey, driveDecrypt, deriveFileKey, fileDecrypt, JWKWallet } from 'ardrive-core-js';
 import axios from 'axios';
+import { setupDriveKey } from './utils';
 
 const GQL_ENDPOINT = 'https://arweave-search.goldsky.com/graphql';
 const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
@@ -31,23 +32,9 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
         }
         
         if (!driveKey) {
-            const pwd = await askPassword();
-            if (pwd) {
-                console.log('Deriving drive key...');
-                const owner = await wallet.getAddress();
-                const driveSignatureInfo = await arDrive.getDriveSignatureInfo({ driveId: driveId as any, owner });
-                
-                driveKey = await deriveDriveKey({
-                    dataEncryptionKey: pwd,
-                    driveId,
-                    walletPrivateKey: JSON.stringify(wallet.getPrivateKey()),
-                    driveSignatureType: driveSignatureInfo.driveSignatureType,
-                    encryptedSignatureData: driveSignatureInfo.encryptedSignatureData
-                });
-                console.log('Drive key derived successfully!');
-                // Save stringified representation in DB for future
-                // db.setConfig('drive_key', JSON.stringify(driveKey));
-            }
+            driveKey = await setupDriveKey(arDrive, wallet, driveId, askPassword);
+            // Save stringified representation in DB for future
+            // db.setConfig('drive_key', JSON.stringify(driveKey));
         }
     }
 
@@ -130,10 +117,15 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                                 decryptedBuffer = await driveDecrypt(cipherIv, driveKey, encryptedBuffer);
                             }
                             
-                            parsedMeta = JSON.parse(decryptedBuffer.toString('utf8'));
+                            const decryptedString = decryptedBuffer.toString('utf8');
+                            if (decryptedString === 'Error' || decryptedBuffer.toString('ascii') === 'Error') {
+                                throw new Error('ardrive-core-js returned Error string instead of throwing');
+                            }
+                            
+                            parsedMeta = JSON.parse(decryptedString);
                         } catch(e) {
-                            parsedMeta = { name: '[Decryption Failed]' };
-                            console.error(`Failed to decrypt metadata for ${txId}: ${e}`);
+                            console.warn(`Failed to decrypt metadata for ${txId} (likely corrupted). Skipping transaction: ${e}`);
+                            continue;
                         }
                     } else if (isPrivate) {
                         parsedMeta = { name: '[Encrypted - No Key]' };
