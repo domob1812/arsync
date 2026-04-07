@@ -109,4 +109,17 @@ export class SyncDB {
         const db = await this.dbPromise;
         return await db.all(`SELECT * FROM entities WHERE parent_folder_id = ?`, parentId);
     }
+
+    public async getEntity(entityId: string): Promise<any> {
+        const db = await this.dbPromise;
+        return await db.get('SELECT * FROM entities WHERE entity_id = ?', entityId);
+    }
+
+    public async updateSyncState(entityId: string, sha256: string, mtime: number, size: number) {
+        const db = await this.dbPromise;
+        await db.run(
+            'UPDATE entities SET synced_local_sha256 = ?, synced_local_mtime = ?, synced_local_size = ? WHERE entity_id = ?',
+            sha256, Math.floor(mtime), size, entityId
+        );
+    }
 }

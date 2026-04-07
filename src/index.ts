@@ -4,6 +4,7 @@ import { Command } from 'commander';
 import { SyncDB } from './db';
 import { runSync } from './sync';
 import { runLs } from './ls';
+import { runDownload } from './download';
 import inquirer from 'inquirer';
 import path from 'path';
 
@@ -52,6 +53,18 @@ program
         await runLs(targetPath);
     } catch (err: any) {
         console.error('Error during ls:', err.message);
+    }
+  });
+
+program
+  .command('download')
+  .description('Download missing files from ArDrive to the local directory')
+  .argument('[path]', 'Path to download (default: current)', '.')
+  .action(async (targetPath) => {
+    try {
+        await runDownload(targetPath);
+    } catch (err: any) {
+        console.error('Error during download:', err.message);
     }
   });
 

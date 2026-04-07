@@ -133,7 +133,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                     type: entityType,
                     name: parsedMeta.name || 'Unknown',
                     parent_folder_id: parentFolderId,
-                    data_tx_id: getTag('Data-Tx-Id') || null,
+                    data_tx_id: parsedMeta.dataTxId || null,
                     size: parsedMeta.size || null,
                     last_modified: parsedMeta.lastModifiedDate || null,
                     metadata_tx_id: txId
