@@ -8,8 +8,8 @@ const GQL_ENDPOINT = 'https://arweave-search.goldsky.com/graphql';
 const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
 
 export async function runSync(db: SyncDB, askPassword: () => Promise<string | null>) {
-    const driveId = db.getConfig('drive_id');
-    const walletPath = db.getConfig('wallet_path');
+    const driveId = await db.getConfig('drive_id');
+    const walletPath = await db.getConfig('wallet_path');
     
     if (!driveId) throw new Error('No drive_id found in config. Did you run checkout?');
     
@@ -23,7 +23,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
         const wallet = new JWKWallet(jwk);
         arDrive = arDriveFactory({ wallet });
         
-        const cachedKey = db.getConfig('drive_key');
+        const cachedKey = await db.getConfig('drive_key');
         if (cachedKey) {
             // Need to parse back to proper object or string based on how it's cached
             // The derived driveKey has a buffer/string structure.
@@ -52,7 +52,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
     }
 
     let hasNextPage = true;
-    let cursor = db.getConfig('last_cursor') || null;
+    let cursor = await db.getConfig('last_cursor') || null;
     let totalFetched = 0;
 
     while (hasNextPage) {
@@ -78,7 +78,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             }
         `;
 
-        console.log(`Fetching next batch from GraphQL... ${cursor ? \`(Cursor: ${cursor})\` : ''}`);
+        console.log(`Fetching next batch from GraphQL... ${cursor ? `(Cursor: ${cursor})` : ''}`);
         const response = await axios.post(GQL_ENDPOINT, {
             query,
             variables: { driveId, cursor }
@@ -128,7 +128,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 }
 
                 // Upsert to DB
-                db.upsertEntity({
+                await db.upsertEntity({
                     entity_id: entityId,
                     type: entityType,
                     name: parsedMeta.name || 'Unknown',
@@ -141,7 +141,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
 
                 totalFetched++;
                 cursor = edge.cursor;
-                db.setConfig('last_cursor', cursor!);
+                await db.setConfig('last_cursor', cursor!);
                 
             } catch (err: any) {
                 console.error(`Failed to process tx ${txId}: ${err.message}`);

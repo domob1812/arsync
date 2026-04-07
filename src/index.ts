@@ -24,9 +24,9 @@ program
     console.log(`Initializing arsync in ${projectPath}`);
     
     const db = new SyncDB(projectPath);
-    db.setConfig('drive_id', driveId);
+    await db.setConfig('drive_id', driveId);
     if (options.wallet) {
-        db.setConfig('wallet_path', path.resolve(options.wallet));
+        await db.setConfig('wallet_path', path.resolve(options.wallet));
     }
 
     await doSync(db);
