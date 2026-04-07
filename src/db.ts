@@ -37,11 +37,14 @@ export class SyncDB {
                 last_modified INTEGER,
                 metadata_tx_id TEXT NOT NULL,
                 
+                unix_time INTEGER NOT NULL DEFAULT 0,
+                
                 synced_local_sha256 TEXT,
                 synced_local_mtime INTEGER,
                 synced_local_size INTEGER
             );
         `);
+        
         return db;
     }
 
@@ -58,22 +61,25 @@ export class SyncDB {
 
     public async upsertEntity(entity: {
         entity_id: string, type: string, name: string, parent_folder_id: string | null,
-        data_tx_id: string | null, size: number | null, last_modified: number | null, metadata_tx_id: string
+        data_tx_id: string | null, size: number | null, last_modified: number | null, metadata_tx_id: string,
+        unix_time: number
     }) {
         const db = await this.dbPromise;
         await db.run(`
-            INSERT INTO entities (entity_id, type, name, parent_folder_id, data_tx_id, size, last_modified, metadata_tx_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO entities (entity_id, type, name, parent_folder_id, data_tx_id, size, last_modified, metadata_tx_id, unix_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(entity_id) DO UPDATE SET
                 name = excluded.name,
                 parent_folder_id = excluded.parent_folder_id,
                 data_tx_id = excluded.data_tx_id,
                 size = excluded.size,
                 last_modified = excluded.last_modified,
-                metadata_tx_id = excluded.metadata_tx_id
+                metadata_tx_id = excluded.metadata_tx_id,
+                unix_time = excluded.unix_time
+            WHERE excluded.unix_time >= entities.unix_time
         `, [
             entity.entity_id, entity.type, entity.name, entity.parent_folder_id,
-            entity.data_tx_id, entity.size, entity.last_modified, entity.metadata_tx_id
+            entity.data_tx_id, entity.size, entity.last_modified, entity.metadata_tx_id, entity.unix_time
         ]);
     }
 

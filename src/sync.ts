@@ -102,6 +102,8 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             const entityType = getTag('Entity-Type');
             const entityId = getTag('File-Id') || getTag('Folder-Id') || getTag('Drive-Id');
             const parentFolderId = getTag('Parent-Folder-Id') || null;
+            const unixTimeStr = getTag('Unix-Time');
+            const unixTime = unixTimeStr ? parseInt(unixTimeStr, 10) : 0;
             const isPrivate = getTag('Cipher-IV') !== undefined;
             const cipherIv = getTag('Cipher-IV');
 
@@ -154,7 +156,8 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                     data_tx_id: parsedMeta.dataTxId || null,
                     size: parsedMeta.size || null,
                     last_modified: parsedMeta.lastModifiedDate || null,
-                    metadata_tx_id: txId
+                    metadata_tx_id: txId,
+                    unix_time: unixTime
                 });
 
                 totalFetched++;
