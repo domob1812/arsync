@@ -76,4 +76,37 @@ export class SyncDB {
             entity.data_tx_id, entity.size, entity.last_modified, entity.metadata_tx_id
         ]);
     }
+
+    public async getRootFolderId(driveId: string): Promise<string | null> {
+        const db = await this.dbPromise;
+        const row = await db.get(`
+            SELECT entity_id FROM entities 
+            WHERE type = 'folder' 
+            AND (parent_folder_id IS NULL OR parent_folder_id = ?)
+        `, driveId);
+        
+        if (row) return row.entity_id;
+        
+        const fallback = await db.get(`
+            SELECT entity_id FROM entities e
+            WHERE type = 'folder' AND NOT EXISTS (
+                SELECT 1 FROM entities p WHERE p.entity_id = e.parent_folder_id AND p.type = 'folder'
+            )
+        `);
+        return fallback ? fallback.entity_id : null;
+    }
+
+    public async getChildFolderByName(parentId: string, name: string): Promise<string | null> {
+        const db = await this.dbPromise;
+        const row = await db.get(`
+            SELECT entity_id FROM entities 
+            WHERE parent_folder_id = ? AND name = ? AND type = 'folder'
+        `, parentId, name);
+        return row ? row.entity_id : null;
+    }
+
+    public async getChildren(parentId: string): Promise<any[]> {
+        const db = await this.dbPromise;
+        return await db.all(`SELECT * FROM entities WHERE parent_folder_id = ?`, parentId);
+    }
 }

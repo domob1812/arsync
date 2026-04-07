@@ -3,6 +3,7 @@
 import { Command } from 'commander';
 import { SyncDB } from './db';
 import { runSync } from './sync';
+import { runLs } from './ls';
 import inquirer from 'inquirer';
 import path from 'path';
 
@@ -40,6 +41,18 @@ program
     const projectPath = path.resolve(dir);
     const db = new SyncDB(projectPath);
     await doSync(db);
+  });
+
+program
+  .command('ls')
+  .description('List files and folders in the synchronized drive')
+  .argument('[path]', 'Path to list (default: current)', '.')
+  .action(async (targetPath) => {
+    try {
+        await runLs(targetPath);
+    } catch (err: any) {
+        console.error('Error during ls:', err.message);
+    }
   });
 
 async function doSync(db: SyncDB) {
