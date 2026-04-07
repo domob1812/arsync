@@ -67,36 +67,46 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
         process.exit(1);
     }
 
-    // Collect all files to download recursively
-    const filesToDownload: { entity: any, relPath: string }[] = [];
+    // Collect all files and folders to download recursively
+    const itemsToDownload: { entity: any, relPath: string }[] = [];
     
-    async function collectFiles(entityId: string, type: string, currentRelPath: string) {
+    async function collectItems(entityId: string, type: string, currentRelPath: string) {
         if (type === 'file') {
             const entity = await db.getEntity(entityId);
-            if (entity) filesToDownload.push({ entity, relPath: currentRelPath });
+            if (entity) itemsToDownload.push({ entity, relPath: currentRelPath });
         } else if (type === 'folder') {
+            const entity = await db.getEntity(entityId);
+            // Push the folder itself so we can create it even if empty
+            if (entity && currentRelPath !== '') {
+                itemsToDownload.push({ entity, relPath: currentRelPath });
+            }
+            
             const children = await db.getChildren(entityId);
             for (const child of children) {
-                await collectFiles(child.entity_id, child.type, path.join(currentRelPath, child.name));
+                await collectItems(child.entity_id, child.type, path.join(currentRelPath, child.name));
             }
         }
     }
 
-    await collectFiles(currentId, currentType, relativePath);
+    await collectItems(currentId, currentType, relativePath);
 
-    console.log(`Found ${filesToDownload.length} file(s) in ArDrive subtree.`);
+    console.log(`Found ${itemsToDownload.length} item(s) in ArDrive subtree.`);
 
     let downloadedCount = 0;
     let skippedCount = 0;
 
-    for (const item of filesToDownload) {
+    for (const item of itemsToDownload) {
         const localFullPath = path.join(projectRoot, item.relPath);
         const entity = item.entity;
 
         if (fs.existsSync(localFullPath)) {
-            // Check if sizes differ or just skip since it's already there
-            // For now, we use simple existence check based on requirement "download all files missing"
             skippedCount++;
+            continue;
+        }
+
+        if (entity.type === 'folder') {
+            console.log(`Creating folder ${item.relPath} ...`);
+            fs.mkdirSync(localFullPath, { recursive: true });
             continue;
         }
 
