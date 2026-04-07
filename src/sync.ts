@@ -1,7 +1,7 @@
 import Arweave from 'arweave';
 import { SyncDB } from './db';
 import { readFileSync } from 'fs';
-import { arDriveFactory, EID, deriveDriveKey, driveDecrypt, JWKWallet } from 'ardrive-core-js';
+import { arDriveFactory, deriveDriveKey, driveDecrypt, deriveFileKey, fileDecrypt, JWKWallet } from 'ardrive-core-js';
 import axios from 'axios';
 
 const GQL_ENDPOINT = 'https://arweave-search.goldsky.com/graphql';
@@ -109,22 +109,40 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
 
             try {
                 // Fetch the actual JSON metadata
-                const txData = await arweave.transactions.getData(txId, { decode: true, string: !isPrivate });
                 let parsedMeta: any = {};
                 
-                if (txData) {
+                try {
                     if (isPrivate && driveKey && cipherIv) {
+                        // For private data, fetch as raw base64url string to parse correctly into a Buffer
+                        const rawData = await arweave.transactions.getData(txId, { decode: true, string: false });
+                        
                         try {
-                            const decryptedBuffer = await driveDecrypt(cipherIv, driveKey, Buffer.from(txData as Uint8Array));
+                            // Arweave gateway returns Uint8Array, we cast directly to Node Buffer
+                            const encryptedBuffer = Buffer.from(rawData as Uint8Array);
+                            
+                            let decryptedBuffer: Buffer;
+                            if (entityType === 'file') {
+                                const fileKey = await deriveFileKey(entityId, driveKey);
+                                decryptedBuffer = await fileDecrypt(cipherIv, fileKey, encryptedBuffer);
+                            } else {
+                                decryptedBuffer = await driveDecrypt(cipherIv, driveKey, encryptedBuffer);
+                            }
+                            
                             parsedMeta = JSON.parse(decryptedBuffer.toString('utf8'));
                         } catch(e) {
                             parsedMeta = { name: '[Decryption Failed]' };
+                            console.error(`Failed to decrypt metadata for ${txId}: ${e}`);
                         }
                     } else if (isPrivate) {
                         parsedMeta = { name: '[Encrypted - No Key]' };
                     } else {
-                        parsedMeta = JSON.parse(txData as string);
+                        // Public data is just stringified JSON
+                        const rawData = await arweave.transactions.getData(txId, { decode: true, string: true });
+                        parsedMeta = JSON.parse(rawData as string);
                     }
+                } catch (dataErr) {
+                    console.error(`Failed to fetch data payload for tx ${txId}:`, dataErr);
+                    continue;
                 }
 
                 // Upsert to DB

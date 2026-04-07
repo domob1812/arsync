@@ -5,9 +5,11 @@ import Arweave from 'arweave';
 import { SyncDB } from './db';
 import { findProjectRoot } from './utils';
 
+import { arDriveFactory, JWKWallet, deriveDriveKey, deriveFileKey, fileDecrypt } from 'ardrive-core-js';
+
 const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
 
-export async function runDownload(targetPath: string) {
+export async function runDownload(targetPath: string, askPassword: () => Promise<string | null>) {
     const cwd = process.cwd();
     const resolvedPath = path.resolve(cwd, targetPath);
     
@@ -25,9 +27,19 @@ export async function runDownload(targetPath: string) {
     
     const db = new SyncDB(projectRoot);
     const driveId = await db.getConfig('drive_id');
+    const walletPath = await db.getConfig('wallet_path');
     if (!driveId) {
         console.error("Error: Project not fully checked out.");
         process.exit(1);
+    }
+
+    let arDrive: any;
+    let driveKey: any;
+    let wallet: JWKWallet | undefined;
+    if (walletPath) {
+        const jwk = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
+        wallet = new JWKWallet(jwk);
+        arDrive = arDriveFactory({ wallet });
     }
 
     // Resolve local path to ArDrive entity
@@ -89,7 +101,7 @@ export async function runDownload(targetPath: string) {
         }
 
         if (!entity.data_tx_id) {
-            console.warn(`Skipping ${item.relPath} (no data_tx_id found on network - could be empty or encrypted).`);
+            console.warn(`Skipping ${item.relPath} (no data_tx_id found in local DB. Sync might be incomplete or corrupted).`);
             skippedCount++;
             continue;
         }
@@ -99,8 +111,54 @@ export async function runDownload(targetPath: string) {
 
         try {
             // Download data from Arweave
-            const data = await arweave.transactions.getData(entity.data_tx_id, { decode: true });
-            const buffer = Buffer.from(data as Uint8Array);
+            const data = await arweave.transactions.getData(entity.data_tx_id, { decode: true, string: false });
+            let buffer = Buffer.from(data as Uint8Array);
+            
+            // Check if we need to decrypt it
+            // We can determine this by fetching the metadata tx tags, or more simply, 
+            // checking if we have the cipher_iv in the DB. 
+            // Since we didn't add cipher_iv to the DB schema in v1, we have to look up the metadata tx on the network
+            // to see if it has a Cipher-IV tag.
+            const metaTagsRes = await arweave.transactions.get(entity.metadata_tx_id);
+            const cipherIvTag = metaTagsRes.tags.find(t => t.get('name', {decode: true, string: true}) === 'Cipher-IV');
+            
+            if (cipherIvTag) {
+                const cipherIv = cipherIvTag.get('value', {decode: true, string: true});
+                
+                // We need the drive key. Ask for password if we haven't yet.
+                if (!driveKey && wallet && arDrive) {
+                    const pwd = await askPassword();
+                    if (!pwd) throw new Error('Password required to download private file.');
+                    
+                    console.log('Deriving drive key for decryption...');
+                    const owner = await wallet.getAddress();
+                    const driveSignatureInfo = await arDrive.getDriveSignatureInfo({ driveId: driveId as any, owner });
+                    
+                    driveKey = await deriveDriveKey({
+                        dataEncryptionKey: pwd,
+                        driveId,
+                        walletPrivateKey: JSON.stringify(wallet.getPrivateKey()),
+                        driveSignatureType: driveSignatureInfo.driveSignatureType,
+                        encryptedSignatureData: driveSignatureInfo.encryptedSignatureData
+                    });
+                }
+                
+                if (!driveKey) {
+                    throw new Error('Could not derive drive key to decrypt file.');
+                }
+                
+                // We also need the Cipher-IV of the DATA transaction, which is different from the Metadata transaction's IV.
+                const dataTxRes = await arweave.transactions.get(entity.data_tx_id);
+                const dataCipherIvTag = dataTxRes.tags.find(t => t.get('name', {decode: true, string: true}) === 'Cipher-IV');
+                if (!dataCipherIvTag) {
+                    throw new Error('Data transaction is missing Cipher-IV tag');
+                }
+                const dataCipherIv = dataCipherIvTag.get('value', {decode: true, string: true});
+                
+                // Decrypt the file
+                const fileKey = await deriveFileKey(entity.entity_id, driveKey);
+                buffer = Buffer.from(await fileDecrypt(dataCipherIv, fileKey, buffer));
+            }
             
             // Write to local disk
             fs.writeFileSync(localFullPath, buffer);

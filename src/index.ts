@@ -62,7 +62,14 @@ program
   .argument('[path]', 'Path to download (default: current)', '.')
   .action(async (targetPath) => {
     try {
-        await runDownload(targetPath);
+        await runDownload(targetPath, async () => {
+            const answers = await inquirer.prompt([{
+                type: 'password',
+                name: 'password',
+                message: 'Enter ArDrive password for private file download:'
+            }]);
+            return answers.password;
+        });
     } catch (err: any) {
         console.error('Error during download:', err.message);
     }
