@@ -94,27 +94,42 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             const isPrivate = getTag('Cipher-IV') !== undefined;
             const cipherIv = getTag('Cipher-IV');
 
-            if (!entityId || !entityType) continue;
+            if (!entityId || !entityType) {
+                // If it's missing core ArFS tags, we can't process it. 
+                // Mark cursor and move on so we don't get stuck.
+                cursor = edge.cursor;
+                await db.setConfig('last_cursor', cursor!);
+                continue;
+            }
 
             try {
                 // Fetch the actual JSON metadata
                 let parsedMeta: any = {};
+                let rawData: Buffer;
                 
                 try {
+                    // Use standard axios to fetch the payload directly from the gateway's base endpoint.
+                    // This supports BOTH Base Layer transactions and ANS-104 bundled data items.
+                    // arweave.transactions.getData() often fails for bundled data items (returns 404 on /tx/.../data).
+                    const gatewayRes = await axios.get(`https://arweave.net/${txId}`, { responseType: 'arraybuffer' });
+                    rawData = Buffer.from(gatewayRes.data);
+                } catch (dataErr: any) {
+                    // If fetching fails, this is a TRANSIENT network/gateway error.
+                    // We MUST abort the sync here. Do not continue or advance the cursor.
+                    console.error(`\nTransient error: Failed to fetch payload for tx ${txId}. Aborting to allow resume later.`);
+                    console.error(`Error details: ${dataErr.message}`);
+                    throw dataErr; // Throws completely out of the while loop
+                }
+
+                try {
                     if (isPrivate && driveKey && cipherIv) {
-                        // For private data, fetch as raw base64url string to parse correctly into a Buffer
-                        const rawData = await arweave.transactions.getData(txId, { decode: true, string: false });
-                        
                         try {
-                            // Arweave gateway returns Uint8Array, we cast directly to Node Buffer
-                            const encryptedBuffer = Buffer.from(rawData as Uint8Array);
-                            
                             let decryptedBuffer: Buffer;
                             if (entityType === 'file') {
                                 const fileKey = await deriveFileKey(entityId, driveKey);
-                                decryptedBuffer = await fileDecrypt(cipherIv, fileKey, encryptedBuffer);
+                                decryptedBuffer = await fileDecrypt(cipherIv, fileKey, rawData);
                             } else {
-                                decryptedBuffer = await driveDecrypt(cipherIv, driveKey, encryptedBuffer);
+                                decryptedBuffer = await driveDecrypt(cipherIv, driveKey, rawData);
                             }
                             
                             const decryptedString = decryptedBuffer.toString('utf8');
@@ -125,17 +140,23 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                             parsedMeta = JSON.parse(decryptedString);
                         } catch(e) {
                             console.warn(`Failed to decrypt metadata for ${txId} (likely corrupted). Skipping transaction: ${e}`);
+                            // It's a permanent error (corrupted data/wrong key). 
+                            // We proceed below to update the cursor, but do not upsert it.
+                            cursor = edge.cursor;
+                            await db.setConfig('last_cursor', cursor!);
                             continue;
                         }
                     } else if (isPrivate) {
                         parsedMeta = { name: '[Encrypted - No Key]' };
                     } else {
                         // Public data is just stringified JSON
-                        const rawData = await arweave.transactions.getData(txId, { decode: true, string: true });
-                        parsedMeta = JSON.parse(rawData as string);
+                        parsedMeta = JSON.parse(rawData.toString('utf8'));
                     }
-                } catch (dataErr) {
-                    console.error(`Failed to fetch data payload for tx ${txId}:`, dataErr);
+                } catch (parseErr: any) {
+                    // If JSON.parse fails, it's a permanent error (malformed data).
+                    console.warn(`Permanent error: Malformed JSON payload for tx ${txId}. Skipping transaction.`);
+                    cursor = edge.cursor;
+                    await db.setConfig('last_cursor', cursor!);
                     continue;
                 }
 
@@ -157,7 +178,16 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 await db.setConfig('last_cursor', cursor!);
                 
             } catch (err: any) {
-                console.error(`Failed to process tx ${txId}: ${err.message}`);
+                // If the error originated from our explicit 'throw dataErr' above, it will be an Axios error.
+                // We MUST re-throw it to completely abort the `runSync` loop.
+                if (err.isAxiosError || err.response || err.request || err.message.includes('network')) {
+                    throw err; 
+                }
+
+                console.error(`Failed to process tx ${txId} due to an unexpected permanent error: ${err.message}`);
+                // Since it's a permanent unexpected error, advance cursor to avoid getting stuck
+                cursor = edge.cursor;
+                await db.setConfig('last_cursor', cursor!);
             }
         }
         
