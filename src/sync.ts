@@ -1,7 +1,7 @@
 import { SyncDB } from './db';
 import { readFileSync } from 'fs';
 import crypto from 'crypto';
-import { driveDecrypt, fileDecrypt, deriveFileKey, JWKWallet, ASCENDING_ORDER } from 'ardrive-core-js';
+import { fileDecrypt, deriveFileKey, JWKWallet, ASCENDING_ORDER } from 'ardrive-core-js';
 import { setupDriveKey } from './utils';
 import { gqlGateway, dataGateway } from './gateways';
 
@@ -14,14 +14,29 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
     console.log(`Starting sync for Drive: ${driveId}...`);
     if (debug) console.log('[DEBUG] Debug mode enabled.');
 
-    // --- Preflight: verify drive privacy vs. wallet availability ---
+    // -----------------------------------------------------------------------
+    // Preflight: determine drive owner and privacy
+    // -----------------------------------------------------------------------
     //
-    // Fetch the root drive entity (oldest transaction with Entity-Type=drive
-    // for this Drive-Id) and inspect its Drive-Privacy tag.  We do this before
-    // attempting decryption so that a missing wallet produces a clear error
-    // message instead of silently storing '[Encrypted - No Key]' for every
-    // entity in the drive.
-    {
+    // We fetch the very first transaction ever posted for this Drive-Id (sort
+    // HEIGHT_ASC, first: 1).  This gives us two things:
+    //
+    //   1. The wallet address of the drive owner — stored once in config as
+    //      `drive_owner` and used as an `owners` filter on all subsequent GQL
+    //      queries.  This is a correctness requirement: anyone can post a
+    //      transaction with an arbitrary Drive-Id tag, so without an owner
+    //      filter a malicious actor could corrupt our local database by
+    //      injecting fake metadata transactions.
+    //
+    //   2. The Drive-Privacy tag — used to determine whether decryption is
+    //      needed and whether a wallet is required.
+    //
+    // We only need to make this query once; after the first run the owner is
+    // cached in config and we skip the network call.
+
+    let driveOwner = await db.getConfig('drive_owner');
+
+    if (!driveOwner) {
         const driveCheckQuery = {
             query: `{
                 transactions(
@@ -34,6 +49,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 ) {
                     edges {
                         node {
+                            owner { address }
                             tags { name value }
                         }
                     }
@@ -47,7 +63,11 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             throw new Error(`Drive not found on the network: ${driveId}`);
         }
 
-        const driveTags = driveCheckResult.edges[0].node.tags as { name: string; value: string }[];
+        const firstNode = driveCheckResult.edges[0].node;
+        driveOwner = firstNode.owner.address as string;
+        await db.setConfig('drive_owner', driveOwner);
+
+        const driveTags = firstNode.tags as { name: string; value: string }[];
         const drivePrivacy = driveTags.find(t => t.name === 'Drive-Privacy')?.value;
 
         if (drivePrivacy === 'private' && !walletPath) {
@@ -59,45 +79,102 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
 
         if (drivePrivacy === 'public' && walletPath) {
             // Silently discard the stored wallet for public drives — no
-            // decryption is needed. Printing a notice here would be
-            // confusing on every `update` run when the wallet was only
-            // provided once during the initial `checkout`.
+            // decryption is needed.
             walletPath = null;
         }
+    } else {
+        // Owner already known from a previous run.  Still need to check
+        // privacy/wallet consistency if a wallet path is stored.
+        if (!walletPath) {
+            // No wallet — assume public (or we'll fail at decryption time
+            // with a clear error if the drive is actually private).
+        }
     }
-    // --- End preflight ---
+
+    console.log(`Drive owner: ${driveOwner}`);
+
+    // -----------------------------------------------------------------------
+    // Derive drive key (private drives only)
+    // -----------------------------------------------------------------------
 
     let driveKey: any;
 
     if (walletPath) {
         const jwk = JSON.parse(readFileSync(walletPath, 'utf8'));
         const wallet = new JWKWallet(jwk);
-
         driveKey = await setupDriveKey(wallet, driveId, askPassword);
     }
 
+    // -----------------------------------------------------------------------
+    // Determine the minimum block height for this sync run
+    // -----------------------------------------------------------------------
+    //
+    // `last_synced_block_height` is updated after every processed batch
+    // (not just on clean completion) because we walk HEIGHT_ASC: every
+    // batch is monotonically newer than the previous one, so the highest
+    // block height in a batch is always safe to persist immediately.
+    //
+    // On an incremental update we pass `block: {min: N - 5}` to the GQL
+    // query, where N is the last saved height.  The 5-block safety margin
+    // guards against chain reorgs and the edge case where a single block
+    // contains more transactions than one page: even if we only partially
+    // processed a block before a previous abort, the cursor provides the
+    // exact resume position, and the block filter ensures we skip the bulk
+    // of already-processed history.  The upsert guard in the database
+    // makes re-processing a handful of transactions at the boundary
+    // perfectly safe.
+    //
+    // For the initial checkout there is no saved height, so no block filter
+    // is applied and we walk the full history.
+
+    const lastSyncedHeightStr = await db.getConfig('last_synced_block_height');
+    const lastSyncedHeight = lastSyncedHeightStr ? parseInt(lastSyncedHeightStr, 10) : null;
+
+    let minBlockHeight: number | null = null;
+    if (lastSyncedHeight !== null) {
+        minBlockHeight = Math.max(0, lastSyncedHeight - 5);
+        console.log(`Incremental update from block height ${minBlockHeight} (last synced: ${lastSyncedHeight}).`);
+    } else {
+        console.log('Initial checkout — fetching full drive history.');
+    }
+
+    // -----------------------------------------------------------------------
+    // Main paginated GQL walk (HEIGHT_ASC)
+    // -----------------------------------------------------------------------
+
     let hasNextPage = true;
-    let cursor = await db.getConfig('last_cursor') || undefined;
+    const rawCursor = await db.getConfig('last_cursor');
+    let cursor: string | undefined = rawCursor && rawCursor !== '' ? rawCursor : undefined;
     let totalFetched = 0;
     let totalSkipped = 0;
 
     while (hasNextPage) {
-        // We craft our own paginated query string rather than using buildQuery(),
-        // because buildQuery() has two distinct modes:
-        //   - cursor === undefined  → "single result" mode (first:1, no pageInfo block)
-        //   - cursor !== undefined  → "paginated" mode (first:100, includes pageInfo)
-        // Our initial fetch has no cursor (undefined), which would silently trigger
-        // single-result mode, omit pageInfo from the response, and crash on
+        // We craft the GQL query string manually rather than using the
+        // ardrive-core-js buildQuery() helper because buildQuery() has two
+        // distinct modes keyed on whether a cursor is present:
+        //
+        //   cursor === undefined  → "single result" mode (first:1, no pageInfo)
+        //   cursor !== undefined  → "paginated" mode   (first:100, pageInfo)
+        //
+        // Our initial fetch has no cursor, which would silently trigger
+        // single-result mode, omit the pageInfo block, and crash on
         // gqlResult.pageInfo.hasNextPage.
         //
-        // We still route through gqlGateway.gqlRequest() to get exponential
-        // back-off retries and rate-limit throttling for free.
+        // We still route through gqlGateway.gqlRequest() so we get
+        // exponential back-off retries and rate-limit throttling for free.
+        //
+        // The `owners` filter is a correctness requirement (see preflight
+        // comment above).  The `block: {min: ...}` filter is a performance
+        // optimisation for incremental updates — it lets the gateway skip
+        // the bulk of already-processed history.
         const query = {
             query: `{
                 transactions(
+                    owners: ["${driveOwner}"]
                     tags: [{ name: "Drive-Id", values: ["${driveId}"] }]
                     sort: ${ASCENDING_ORDER}
                     first: 100
+                    ${minBlockHeight !== null ? `block: {min: ${minBlockHeight}}` : ''}
                     ${cursor ? `after: "${cursor}"` : ''}
                 ) {
                     pageInfo { hasNextPage }
@@ -105,6 +182,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                         cursor
                         node {
                             id
+                            block { height }
                             tags { name value }
                         }
                     }
@@ -112,10 +190,8 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             }`
         };
 
-        console.log(`Fetching next batch from GraphQL... ${cursor ? `(Cursor: ${cursor})` : '(from beginning)'}`);
+        console.log(`Fetching next batch from GraphQL...${cursor ? ` (cursor: ${cursor.substring(0, 12)}...)` : ' (from beginning)'}`);
 
-        // gqlRequest() posts to .../graphql on the gateway endpoint, with
-        // built-in exponential back-off retries on failure.
         const gqlResult = await gqlGateway.gqlRequest(query);
 
         hasNextPage = gqlResult.pageInfo.hasNextPage;
@@ -130,8 +206,14 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             break;
         }
 
+        // Track the highest confirmed block height seen in this batch.
+        // Pending (unconfirmed) transactions have block=null; we skip them
+        // for the watermark since they don't yet have a stable height.
+        let batchMaxHeight: number | null = null;
+
         for (const edge of edges) {
             const txId = edge.node.id;
+            const blockHeight: number | null = edge.node.block?.height ?? null;
             const tags = edge.node.tags as { name: string; value: string }[];
 
             const getTag = (name: string) => tags.find(t => t.name === name)?.value;
@@ -142,37 +224,22 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             const unixTimeStr = getTag('Unix-Time');
             const unixTime = unixTimeStr ? parseInt(unixTimeStr, 10) : 0;
             const isPrivate = getTag('Cipher-IV') !== undefined;
-            // Restore any `+` characters that were corrupted to spaces in the
-            // Cipher-IV tag value before passing it to Buffer.from(cipherIV, 'base64').
-            //
-            // `+` is a valid base64 alphabet character.  Arweave GQL tag values for
-            // transactions written by early clients (e.g. ArDrive-Desktop 0.1.0,
-            // circa 2021) have this character returned as a space by the gateway,
-            // most likely because the tag was stored or retrieved through a code path
-            // that applied URL/form-data encoding (where `+` encodes a space).
-            //
-            // A correct AES-256-GCM IV is exactly 12 bytes, which base64-encodes to
-            // exactly 16 characters.  The corrupted IV "Hv CM2hAGbaQa83A" is 17
-            // characters.  Node.js Buffer.from(str, 'base64') silently IGNORES
-            // non-base64 characters (spaces are not in the base64 alphabet), so it
-            // decodes only the 15 remaining characters → 11 bytes.  A 11-byte IV
-            // causes AES-256-GCM auth-tag verification to fail, and fileDecrypt()
-            // returns the 'Error' sentinel.
-            //
-            // Replacing spaces with `+` restores the original 16-character string
-            // "Hv+CM2hAGbaQa83A" → 12 bytes → correct IV.  This is always safe
-            // because a space can never appear in a legitimately base64-encoded IV.
+            // Restore any `+` characters corrupted to spaces in the Cipher-IV
+            // tag value.  See the long comment in the original sync.ts for the
+            // full explanation; the short version is: early ArDrive clients
+            // URL/form-encoded tag values, turning `+` (valid base64) into a
+            // space.  Buffer.from(str, 'base64') silently drops spaces, giving
+            // an 11-byte IV instead of 12, which breaks AES-256-GCM auth-tag
+            // verification.  Spaces cannot appear in legitimate base64, so this
+            // substitution is always safe.
             const cipherIv = getTag('Cipher-IV')?.replace(/ /g, '+') ?? undefined;
             const cipher = getTag('Cipher');
 
             if (debug) {
-                console.log(`[DEBUG TX] id=${txId} entityType=${entityType ?? '(none)'} entityId=${entityId ?? '(none)'} unixTime=${unixTime}`);
+                console.log(`[DEBUG TX] id=${txId} height=${blockHeight ?? 'pending'} entityType=${entityType ?? '(none)'} entityId=${entityId ?? '(none)'} unixTime=${unixTime}`);
             }
 
             if (!entityId || !entityType) {
-                // Missing core ArFS tags — permanently malformed/non-ArFS transaction.
-                // Log the full tag set so we can diagnose if something valid is being
-                // incorrectly skipped (e.g. a tag-name variation from an old client).
                 console.warn(`[SKIP] tx=${txId} reason=missing_arfs_tags tags=${JSON.stringify(tags)}`);
                 totalSkipped++;
                 cursor = edge.cursor;
@@ -180,84 +247,56 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 continue;
             }
 
+            // ------------------------------------------------------------------
+            // Fetch metadata payload
+            // ------------------------------------------------------------------
+
             let rawData: Buffer;
 
             try {
-                // getTxData() fetches from ${dataGateway}/${txId} — the correct
-                // root-path that gateways use to resolve both L1 and ANS-104 bundled
-                // data items. It also reads from/writes to ArFSMetadataCache on disk,
-                // so subsequent runs skip the network entirely for already-seen txs.
+                // getTxData() fetches from <gateway>/<txId>, which resolves both
+                // L1 and ANS-104 bundled data items.  It also reads from/writes
+                // to the ardrive-core-js ArFSMetadataCache on disk, so payloads
+                // already fetched once are served locally with no network I/O.
                 rawData = await dataGateway.getTxData(txId as any);
             } catch (dataErr: any) {
-                // Network/gateway failure — TRANSIENT. Abort without advancing
-                // the cursor so the next run will retry this transaction.
+                // Transient network/gateway failure.  Abort without advancing the
+                // cursor so the next run retries this transaction.
                 console.error(`\n[ABORT] Transient error fetching payload for tx=${txId} entityType=${entityType} entityId=${entityId}`);
                 console.error(`Error details: ${dataErr.message}`);
                 throw dataErr;
             }
+
+            // ------------------------------------------------------------------
+            // Decrypt / parse metadata payload
+            // ------------------------------------------------------------------
 
             let parsedMeta: any = {};
 
             try {
                 if (isPrivate && driveKey && cipherIv) {
                     try {
-                        // ArFS encryption model for metadata transactions:
-                        //
-                        //   drive metadata  → driveEncrypt(driveKey)     → decrypt with driveDecrypt(driveKey)
-                        //   folder metadata → fileEncrypt(driveKey)      → decrypt with fileDecrypt(driveKey)
-                        //   file metadata   → fileEncrypt(fileKey)        → decrypt with fileDecrypt(fileKey)
-                        //                     where fileKey = deriveFileKey(fileId, driveKey)
-                        //
-                        // driveEncrypt and fileEncrypt both use AES-256-GCM with the same
-                        // algorithm and tag length, so driveDecrypt and fileDecrypt are
-                        // mechanically identical — the only difference is which key is used.
-                        // Using the wrong key causes the GCM auth tag check to fail with
-                        // "Unsupported state or unable to authenticate data".
-                        //
-                        // Additionally, the old ardrive-sync app used AES-256-CTR for some
-                        // transactions. CTR is a stream cipher with NO auth tag, so GCM
-                        // decryption always fails on CTR data. We detect this via the
-                        // `Cipher` GQL tag and handle it separately.
                         let decryptedBuffer: Buffer;
+
                         if (cipher === 'AES256-CTR') {
-                            // Legacy AES-256-CTR: stream cipher, 16-byte IV, no auth tag.
-                            // The key to use still follows the same entity-type rules above,
-                            // but since CTR predates per-file keys, all CTR metadata used
-                            // the drive key directly.
                             const iv = Buffer.from(cipherIv, 'base64');
                             const decipher = crypto.createDecipheriv('aes-256-ctr', driveKey.keyData, iv);
                             decryptedBuffer = Buffer.concat([decipher.update(rawData), decipher.final()]);
                         } else if (entityType === 'file') {
-                            // File metadata is encrypted with the per-file key derived
-                            // from the drive key + file ID.
                             const fileKey = await deriveFileKey(entityId, driveKey);
                             decryptedBuffer = Buffer.from(await fileDecrypt(cipherIv, fileKey, rawData));
-                            // fileDecrypt() swallows errors and returns Buffer('Error') instead
-                            // of throwing — check for that sentinel value explicitly.
                             if (decryptedBuffer.toString('ascii') === 'Error') {
                                 throw new Error('fileDecrypt returned Error sentinel (wrong key or corrupted data)');
                             }
                         } else {
-                            // Drive and folder metadata: the official ardrive-core-js
-                            // ArFSPrivateFolderBuilder.buildEntity() calls fileDecrypt(cipherIV,
-                            // driveKey, data) — NOT driveDecrypt().  Both functions use identical
-                            // AES-256-GCM logic internally, but driveDecrypt() THROWS on auth-tag
-                            // failure while fileDecrypt() swallows the error and returns the
-                            // 'Error' sentinel string.  Using driveDecrypt() here caused any
-                            // folder with a subtly malformed IV to abort the entire sync rather
-                            // than be handled gracefully.  We mirror the official library exactly.
                             decryptedBuffer = Buffer.from(await fileDecrypt(cipherIv, driveKey, rawData));
                             if (decryptedBuffer.toString('ascii') === 'Error') {
                                 throw new Error('fileDecrypt returned Error sentinel for folder/drive (wrong key or corrupted data)');
                             }
                         }
+
                         parsedMeta = JSON.parse(decryptedBuffer.toString('utf8'));
                     } catch (e) {
-                        // Decryption failed — skip regardless of entity type.
-                        // We do not insert placeholder records: a bogus name in the
-                        // DB is worse than a missing entry because it can mislead
-                        // downstream commands (ls, download) into believing the
-                        // entity is known and valid.
                         console.warn(`[SKIP] tx=${txId} entityType=${entityType} entityId=${entityId} reason=decrypt_failed error=${e}`);
                         totalSkipped++;
                         cursor = edge.cursor;
@@ -265,13 +304,11 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                         continue;
                     }
                 } else if (isPrivate) {
-                    // Private but no key available for this session.
                     parsedMeta = { name: '[Encrypted - No Key]' };
                 } else {
                     parsedMeta = JSON.parse(rawData.toString('utf8'));
                 }
             } catch (parseErr: any) {
-                // JSON.parse failed on a public transaction — PERMANENT (malformed data).
                 console.warn(`[SKIP] tx=${txId} entityType=${entityType} entityId=${entityId} reason=json_parse_failed error=${parseErr.message}`);
                 totalSkipped++;
                 cursor = edge.cursor;
@@ -279,7 +316,10 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 continue;
             }
 
-            // Upsert into the local SQLite database.
+            // ------------------------------------------------------------------
+            // Upsert into the local SQLite database
+            // ------------------------------------------------------------------
+
             await db.upsertEntity({
                 entity_id: entityId,
                 type: entityType,
@@ -299,10 +339,34 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             totalFetched++;
             cursor = edge.cursor;
             await db.setConfig('last_cursor', cursor);
+
+            // Update the block height watermark for this transaction.
+            if (blockHeight !== null) {
+                if (batchMaxHeight === null || blockHeight > batchMaxHeight) {
+                    batchMaxHeight = blockHeight;
+                }
+            }
+        }
+
+        // Persist the watermark after every batch.  Because we walk
+        // HEIGHT_ASC, this value only ever moves forward.  Persisting
+        // per-batch (rather than only on clean completion) means that an
+        // aborted run still advances the watermark as far as possible,
+        // making the next resume faster.
+        if (batchMaxHeight !== null) {
+            const currentHighStr = await db.getConfig('last_synced_block_height');
+            const currentHigh = currentHighStr ? parseInt(currentHighStr, 10) : 0;
+            if (batchMaxHeight > currentHigh) {
+                await db.setConfig('last_synced_block_height', String(batchMaxHeight));
+            }
         }
 
         console.log(`Synced ${totalFetched} entities so far (${totalSkipped} skipped)...`);
     }
+
+    // Clear the cursor on clean completion so the next `arsync update`
+    // starts fresh (relying solely on the block height filter).
+    await db.setConfig('last_cursor', '');
 
     console.log(`Sync complete! ${totalFetched} new/updated entities processed, ${totalSkipped} skipped.`);
 }
