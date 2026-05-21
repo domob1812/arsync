@@ -1,30 +1,59 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import Arweave from 'arweave';
 import { SyncDB } from './db';
 import { findProjectRoot, setupDriveKey } from './utils';
+import { JWKWallet, deriveFileKey, fileDecrypt, GatewayAPI, buildQuery } from 'ardrive-core-js';
 
-import { arDriveFactory, JWKWallet, deriveDriveKey, deriveFileKey, fileDecrypt } from 'ardrive-core-js';
+// Same two-gateway pattern as sync.ts:
+//
+// - gqlGateway: Goldsky GraphQL indexer.
+//               Used to reliably look up transaction tags by ID (including
+//               for ANS-104 bundled data items where /tx/{txId} would fail).
+//
+// - dataGateway: arweave.net full gateway.
+//                Used to fetch raw file data payloads via getTxData(),
+//                which uses the root-path endpoint supporting both L1 and
+//                ANS-104 bundled items, with retries and ArFSMetadataCache.
 
-const arweave = Arweave.init({ host: 'arweave.net', port: 443, protocol: 'https' });
+const gqlGateway = new GatewayAPI({
+    gatewayUrl: new URL('https://arweave-search.goldsky.com/'),
+});
+
+const dataGateway = new GatewayAPI({
+    gatewayUrl: new URL('https://arweave.net/'),
+});
+
+/**
+ * Fetches the tags for a given transaction ID via GQL.
+ * This is the safe way to retrieve tags for any transaction, including
+ * ANS-104 bundled data items, since /tx/{txId} can return 404 for those.
+ */
+async function getTagsForTxId(txId: string): Promise<{ name: string; value: string }[]> {
+    const query = buildQuery({ tags: [], ids: [txId as any] });
+    const result = await gqlGateway.gqlRequest(query);
+    if (!result.edges || result.edges.length === 0) {
+        throw new Error(`No GQL result found for transaction ID: ${txId}`);
+    }
+    return result.edges[0].node.tags as { name: string; value: string }[];
+}
 
 export async function runDownload(targetPath: string, askPassword: () => Promise<string | null>) {
     const cwd = process.cwd();
     const resolvedPath = path.resolve(cwd, targetPath);
-    
+
     const projectRoot = findProjectRoot(cwd);
     if (!projectRoot) {
         console.error("Error: Not inside an arsync project.");
         process.exit(1);
     }
-    
+
     const relativePath = path.relative(projectRoot, resolvedPath);
     if (relativePath.startsWith('..')) {
         console.error("Error: Path is outside the arsync project.");
         process.exit(1);
     }
-    
+
     const db = new SyncDB(projectRoot);
     const driveId = await db.getConfig('drive_id');
     const walletPath = await db.getConfig('wallet_path');
@@ -33,13 +62,14 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
         process.exit(1);
     }
 
-    let arDrive: any;
     let driveKey: any;
     let wallet: JWKWallet | undefined;
     if (walletPath) {
         const jwk = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
         wallet = new JWKWallet(jwk);
-        arDrive = arDriveFactory({ wallet });
+        // Note: we do NOT construct arDrive here. setupDriveKey constructs
+        // its own arDriveFactory instance internally, pointed at Goldsky.
+        // The unused `arDrive` variable that was here before has been removed.
     }
 
     // Resolve local path to ArDrive entity
@@ -69,7 +99,7 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
 
     // Collect all files and folders to download recursively
     const itemsToDownload: { entity: any, relPath: string }[] = [];
-    
+
     async function collectItems(entityId: string, type: string, currentRelPath: string) {
         if (type === 'file') {
             const entity = await db.getEntity(entityId);
@@ -80,7 +110,7 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
             if (entity && currentRelPath !== '') {
                 itemsToDownload.push({ entity, relPath: currentRelPath });
             }
-            
+
             const children = await db.getChildren(entityId);
             for (const child of children) {
                 await collectItems(child.entity_id, child.type, path.join(currentRelPath, child.name));
@@ -120,51 +150,49 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
         fs.mkdirSync(path.dirname(localFullPath), { recursive: true });
 
         try {
-            // Download data from Arweave
-            const data = await arweave.transactions.getData(entity.data_tx_id, { decode: true, string: false });
-            let buffer = Buffer.from(data as Uint8Array);
-            
-            // Check if we need to decrypt it
-            // We can determine this by fetching the metadata tx tags, or more simply, 
-            // checking if we have the cipher_iv in the DB. 
-            // Since we didn't add cipher_iv to the DB schema in v1, we have to look up the metadata tx on the network
-            // to see if it has a Cipher-IV tag.
-            const metaTagsRes = await arweave.transactions.get(entity.metadata_tx_id);
-            const cipherIvTag = metaTagsRes.tags.find(t => t.get('name', {decode: true, string: true}) === 'Cipher-IV');
-            
-            if (cipherIvTag) {
-                const cipherIv = cipherIvTag.get('value', {decode: true, string: true});
-                
-                // We need the drive key. Ask for password if we haven't yet.
-                if (!driveKey && wallet && arDrive) {
-                    driveKey = await setupDriveKey(arDrive, wallet, driveId, askPassword);
+            // Fetch the metadata transaction's tags via GQL to check for Cipher-IV.
+            // We use GQL (not /tx/{txId}) so this works for ANS-104 bundled items too.
+            const metaTags = await getTagsForTxId(entity.metadata_tx_id);
+            const getMetaTag = (name: string) => metaTags.find(t => t.name === name)?.value;
+            const metaCipherIv = getMetaTag('Cipher-IV');
+
+            // Fetch the actual file data payload.
+            // getTxData() uses the root-path endpoint (arweave.net/{txId}) which correctly
+            // handles both L1 and ANS-104 bundled data items, with retries and disk cache.
+            let buffer = await dataGateway.getTxData(entity.data_tx_id as any);
+
+            if (metaCipherIv) {
+                // The file is encrypted. We need the drive key.
+                if (!driveKey && wallet) {
+                    driveKey = await setupDriveKey(wallet, driveId, askPassword);
                 }
-                
+
                 if (!driveKey) {
                     throw new Error('Could not derive drive key to decrypt file.');
                 }
-                
-                // We also need the Cipher-IV of the DATA transaction, which is different from the Metadata transaction's IV.
-                const dataTxRes = await arweave.transactions.get(entity.data_tx_id);
-                const dataCipherIvTag = dataTxRes.tags.find(t => t.get('name', {decode: true, string: true}) === 'Cipher-IV');
-                if (!dataCipherIvTag) {
+
+                // The data transaction has its OWN Cipher-IV, separate from the
+                // metadata transaction's Cipher-IV. Fetch it via GQL as well.
+                const dataTags = await getTagsForTxId(entity.data_tx_id);
+                const dataCipherIv = dataTags.find(t => t.name === 'Cipher-IV')?.value;
+
+                if (!dataCipherIv) {
                     throw new Error('Data transaction is missing Cipher-IV tag');
                 }
-                const dataCipherIv = dataCipherIvTag.get('value', {decode: true, string: true});
-                
-                // Decrypt the file
+
+                // Derive the file-specific key and decrypt.
                 const fileKey = await deriveFileKey(entity.entity_id, driveKey);
                 buffer = Buffer.from(await fileDecrypt(dataCipherIv, fileKey, buffer));
             }
-            
-            // Write to local disk
+
+            // Write decrypted (or plain) file to disk.
             fs.writeFileSync(localFullPath, buffer);
-            
-            // Compute hash for state index
+
+            // Compute SHA256 hash and record sync state in the database.
+            // This is the baseline for future change detection (see design notes).
             const hash = crypto.createHash('sha256').update(buffer).digest('hex');
             const stats = fs.statSync(localFullPath);
-            
-            // Update database index state
+
             await db.updateSyncState(entity.entity_id, hash, stats.mtimeMs, stats.size);
             downloadedCount++;
         } catch (err: any) {
