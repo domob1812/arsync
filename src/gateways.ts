@@ -10,24 +10,24 @@
  * Two distinct instances are used intentionally:
  *
  *   gqlGateway  — used for all GraphQL queries (POST .../graphql).
- *                 Points at arweave.net because it has authoritative,
- *                 complete coverage of all ArFS transactions, including
- *                 older L1 transactions and ANS-104 bundled data items.
- *                 Third-party indexers such as Goldsky have historically
- *                 had coverage gaps for older / less popular drives.
+ *                 Points at Goldsky, which runs a purpose-built search
+ *                 backend optimised for tag-filtered queries.
+ *                 If you encounter missing entities for a very old drive,
+ *                 try switching this to https://arweave.net/ as a fallback.
  *
  *   dataGateway — used for all raw data payload fetches (GET .../{txId}).
- *                 The root-path endpoint on a full gateway resolves both
- *                 base-layer L1 transactions and ANS-104 bundled data items
- *                 transparently.  It also integrates with the ardrive-core-js
- *                 ArFSMetadataCache so that payloads already fetched once are
- *                 served from disk on subsequent runs with no network round-trip.
+ *                 Points at arweave.net because it is a full gateway that
+ *                 resolves both base-layer L1 transactions and ANS-104
+ *                 bundled data items transparently.  It also integrates
+ *                 with the ardrive-core-js ArFSMetadataCache so that
+ *                 payloads already fetched once are served from disk on
+ *                 subsequent runs with no network round-trip.
  */
 
 import { GatewayAPI } from 'ardrive-core-js';
 
 export const gqlGateway = new GatewayAPI({
-    gatewayUrl: new URL('https://arweave.net/'),
+    gatewayUrl: new URL('https://arweave-search.goldsky.com/'),
 });
 
 export const dataGateway = new GatewayAPI({
