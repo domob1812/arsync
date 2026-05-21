@@ -26,11 +26,64 @@ const dataGateway = new GatewayAPI({
 
 export async function runSync(db: SyncDB, askPassword: () => Promise<string | null>) {
     const driveId = await db.getConfig('drive_id');
-    const walletPath = await db.getConfig('wallet_path');
+    let walletPath = await db.getConfig('wallet_path');
 
     if (!driveId) throw new Error('No drive_id found in config. Did you run checkout?');
 
     console.log(`Starting sync for Drive: ${driveId}...`);
+
+    // --- Preflight: verify drive privacy vs. wallet availability ---
+    //
+    // Fetch the root drive entity (oldest transaction with Entity-Type=drive
+    // for this Drive-Id) and inspect its Drive-Privacy tag.  We do this before
+    // attempting decryption so that a missing wallet produces a clear error
+    // message instead of silently storing '[Encrypted - No Key]' for every
+    // entity in the drive.
+    {
+        const driveCheckQuery = {
+            query: `{
+                transactions(
+                    tags: [
+                        { name: "Drive-Id", values: ["${driveId}"] }
+                        { name: "Entity-Type", values: ["drive"] }
+                    ]
+                    sort: ${ASCENDING_ORDER}
+                    first: 1
+                ) {
+                    edges {
+                        node {
+                            tags { name value }
+                        }
+                    }
+                }
+            }`
+        };
+
+        const driveCheckResult = await gqlGateway.gqlRequest(driveCheckQuery);
+
+        if (driveCheckResult.edges.length === 0) {
+            throw new Error(`Drive not found on the network: ${driveId}`);
+        }
+
+        const driveTags = driveCheckResult.edges[0].node.tags as { name: string; value: string }[];
+        const drivePrivacy = driveTags.find(t => t.name === 'Drive-Privacy')?.value;
+
+        if (drivePrivacy === 'private' && !walletPath) {
+            throw new Error(
+                `Drive ${driveId} is private but no wallet was provided.\n` +
+                `Re-run checkout with the -w flag: arsync checkout ${driveId} -w /path/to/wallet.json .`
+            );
+        }
+
+        if (drivePrivacy === 'public' && walletPath) {
+            // Silently discard the stored wallet for public drives — no
+            // decryption is needed. Printing a notice here would be
+            // confusing on every `update` run when the wallet was only
+            // provided once during the initial `checkout`.
+            walletPath = null;
+        }
+    }
+    // --- End preflight ---
 
     let driveKey: any;
 
