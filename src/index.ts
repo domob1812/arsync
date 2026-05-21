@@ -5,6 +5,8 @@ import { SyncDB } from './db';
 import { runSync } from './sync';
 import { runLs } from './ls';
 import { runDownload } from './download';
+import { runDiagnose } from './diagnose';
+import { findProjectRoot } from './utils';
 import inquirer from 'inquirer';
 import path from 'path';
 
@@ -21,6 +23,7 @@ program
   .argument('<driveId>', 'The ArFS Drive ID to sync')
   .argument('[dir]', 'Directory to initialize (default: current)', '.')
   .option('-w, --wallet <path>', 'Path to Arweave wallet JSON file')
+  .option('--debug', 'Print verbose per-transaction debug output during sync')
   .action(async (driveId, dir, options) => {
     const projectPath = path.resolve(dir);
     console.log(`Initializing arsync in ${projectPath}`);
@@ -31,17 +34,18 @@ program
         await db.setConfig('wallet_path', path.resolve(options.wallet));
     }
 
-    await doSync(db);
+    await doSync(db, options.debug ?? false);
   });
 
 program
   .command('update')
   .description('Fetch the latest metadata changes from ArDrive')
   .argument('[dir]', 'Directory to update (default: current)', '.')
-  .action(async (dir) => {
+  .option('--debug', 'Print verbose per-transaction debug output during sync')
+  .action(async (dir, options) => {
     const projectPath = path.resolve(dir);
     const db = new SyncDB(projectPath);
-    await doSync(db);
+    await doSync(db, options.debug ?? false);
   });
 
 program
@@ -75,7 +79,28 @@ program
     }
   });
 
-async function doSync(db: SyncDB) {
+program
+  .command('diagnose')
+  .description('Investigate why a specific entity (file or folder) is missing from the local database')
+  .argument('<entityId>', 'The ArFS entity ID (folder ID or file ID) to investigate')
+  .argument('[dir]', 'Project directory containing the .arsync folder (default: current)', '.')
+  .action(async (entityId, dir) => {
+    const projectPath = path.resolve(dir);
+    const root = findProjectRoot(projectPath);
+    if (!root) {
+        console.error(`No .arsync project found at or above: ${projectPath}`);
+        console.error('Run "arsync checkout <driveId>" first, or specify the project directory.');
+        process.exit(1);
+    }
+    const db = new SyncDB(root);
+    try {
+        await runDiagnose(entityId, db);
+    } catch (err: any) {
+        console.error('Error during diagnose:', err.message);
+    }
+  });
+
+async function doSync(db: SyncDB, debug: boolean) {
     try {
         await runSync(db, async () => {
             const answers = await inquirer.prompt([{
@@ -84,9 +109,10 @@ async function doSync(db: SyncDB) {
                 message: 'Enter ArDrive password for private drive:'
             }]);
             return answers.password;
-        });
+        }, debug);
     } catch (err: any) {
-        console.error('Error during sync:', err.message);
+        console.error('Sync aborted:', err.message);
+        process.exit(1);
     }
 }
 

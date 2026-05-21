@@ -1,36 +1,18 @@
 import { SyncDB } from './db';
 import { readFileSync } from 'fs';
 import crypto from 'crypto';
-import { driveDecrypt, fileDecrypt, deriveFileKey, JWKWallet, GatewayAPI, ASCENDING_ORDER } from 'ardrive-core-js';
+import { driveDecrypt, fileDecrypt, deriveFileKey, JWKWallet, ASCENDING_ORDER } from 'ardrive-core-js';
 import { setupDriveKey } from './utils';
+import { gqlGateway, dataGateway } from './gateways';
 
-// Two separate GatewayAPI instances, each pointed at the right service for its role:
-//
-// - gqlGateway: Goldsky is a dedicated, high-performance GraphQL indexer.
-//               Used exclusively for gqlRequest() calls (POST .../graphql).
-//               Cannot serve transaction data payloads.
-//
-// - dataGateway: arweave.net is a full Arweave gateway.
-//                Used exclusively for getTxData() calls (GET .../{txId}).
-//                Correctly handles both L1 transactions AND ANS-104 bundled
-//                data items via the root-path endpoint, with built-in
-//                exponential back-off retries and ArFSMetadataCache integration.
-
-const gqlGateway = new GatewayAPI({
-    gatewayUrl: new URL('https://arweave-search.goldsky.com/'),
-});
-
-const dataGateway = new GatewayAPI({
-    gatewayUrl: new URL('https://arweave.net/'),
-});
-
-export async function runSync(db: SyncDB, askPassword: () => Promise<string | null>) {
+export async function runSync(db: SyncDB, askPassword: () => Promise<string | null>, debug = false) {
     const driveId = await db.getConfig('drive_id');
     let walletPath = await db.getConfig('wallet_path');
 
     if (!driveId) throw new Error('No drive_id found in config. Did you run checkout?');
 
     console.log(`Starting sync for Drive: ${driveId}...`);
+    if (debug) console.log('[DEBUG] Debug mode enabled.');
 
     // --- Preflight: verify drive privacy vs. wallet availability ---
     //
@@ -97,6 +79,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
     let hasNextPage = true;
     let cursor = await db.getConfig('last_cursor') || undefined;
     let totalFetched = 0;
+    let totalSkipped = 0;
 
     while (hasNextPage) {
         // We craft our own paginated query string rather than using buildQuery(),
@@ -131,12 +114,16 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
 
         console.log(`Fetching next batch from GraphQL... ${cursor ? `(Cursor: ${cursor})` : '(from beginning)'}`);
 
-        // gqlRequest() posts to .../graphql on the Goldsky endpoint, with
+        // gqlRequest() posts to .../graphql on the gateway endpoint, with
         // built-in exponential back-off retries on failure.
         const gqlResult = await gqlGateway.gqlRequest(query);
 
         hasNextPage = gqlResult.pageInfo.hasNextPage;
         const edges = gqlResult.edges;
+
+        if (debug) {
+            console.log(`[DEBUG] Page returned ${edges.length} edges. hasNextPage=${hasNextPage}`);
+        }
 
         if (edges.length === 0) {
             console.log('No new transactions found.');
@@ -155,12 +142,39 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             const unixTimeStr = getTag('Unix-Time');
             const unixTime = unixTimeStr ? parseInt(unixTimeStr, 10) : 0;
             const isPrivate = getTag('Cipher-IV') !== undefined;
-            const cipherIv = getTag('Cipher-IV');
+            // Restore any `+` characters that were corrupted to spaces in the
+            // Cipher-IV tag value before passing it to Buffer.from(cipherIV, 'base64').
+            //
+            // `+` is a valid base64 alphabet character.  Arweave GQL tag values for
+            // transactions written by early clients (e.g. ArDrive-Desktop 0.1.0,
+            // circa 2021) have this character returned as a space by the gateway,
+            // most likely because the tag was stored or retrieved through a code path
+            // that applied URL/form-data encoding (where `+` encodes a space).
+            //
+            // A correct AES-256-GCM IV is exactly 12 bytes, which base64-encodes to
+            // exactly 16 characters.  The corrupted IV "Hv CM2hAGbaQa83A" is 17
+            // characters.  Node.js Buffer.from(str, 'base64') silently IGNORES
+            // non-base64 characters (spaces are not in the base64 alphabet), so it
+            // decodes only the 15 remaining characters → 11 bytes.  A 11-byte IV
+            // causes AES-256-GCM auth-tag verification to fail, and fileDecrypt()
+            // returns the 'Error' sentinel.
+            //
+            // Replacing spaces with `+` restores the original 16-character string
+            // "Hv+CM2hAGbaQa83A" → 12 bytes → correct IV.  This is always safe
+            // because a space can never appear in a legitimately base64-encoded IV.
+            const cipherIv = getTag('Cipher-IV')?.replace(/ /g, '+') ?? undefined;
             const cipher = getTag('Cipher');
 
+            if (debug) {
+                console.log(`[DEBUG TX] id=${txId} entityType=${entityType ?? '(none)'} entityId=${entityId ?? '(none)'} unixTime=${unixTime}`);
+            }
+
             if (!entityId || !entityType) {
-                // Missing core ArFS tags — permanently malformed transaction.
-                // Advance cursor so we don't get stuck on it.
+                // Missing core ArFS tags — permanently malformed/non-ArFS transaction.
+                // Log the full tag set so we can diagnose if something valid is being
+                // incorrectly skipped (e.g. a tag-name variation from an old client).
+                console.warn(`[SKIP] tx=${txId} reason=missing_arfs_tags tags=${JSON.stringify(tags)}`);
+                totalSkipped++;
                 cursor = edge.cursor;
                 await db.setConfig('last_cursor', cursor);
                 continue;
@@ -177,7 +191,7 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
             } catch (dataErr: any) {
                 // Network/gateway failure — TRANSIENT. Abort without advancing
                 // the cursor so the next run will retry this transaction.
-                console.error(`\nTransient error: Failed to fetch payload for tx ${txId}. Aborting to allow resume later.`);
+                console.error(`\n[ABORT] Transient error fetching payload for tx=${txId} entityType=${entityType} entityId=${entityId}`);
                 console.error(`Error details: ${dataErr.message}`);
                 throw dataErr;
             }
@@ -214,8 +228,8 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                             const decipher = crypto.createDecipheriv('aes-256-ctr', driveKey.keyData, iv);
                             decryptedBuffer = Buffer.concat([decipher.update(rawData), decipher.final()]);
                         } else if (entityType === 'file') {
-                            // File metadata is encrypted with the per-file key.
-                            // entityId here is the File-Id tag value.
+                            // File metadata is encrypted with the per-file key derived
+                            // from the drive key + file ID.
                             const fileKey = await deriveFileKey(entityId, driveKey);
                             decryptedBuffer = Buffer.from(await fileDecrypt(cipherIv, fileKey, rawData));
                             // fileDecrypt() swallows errors and returns Buffer('Error') instead
@@ -224,14 +238,28 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                                 throw new Error('fileDecrypt returned Error sentinel (wrong key or corrupted data)');
                             }
                         } else {
-                            // Drive and folder metadata are both decrypted with the drive key.
-                            decryptedBuffer = await driveDecrypt(cipherIv, driveKey, rawData);
+                            // Drive and folder metadata: the official ardrive-core-js
+                            // ArFSPrivateFolderBuilder.buildEntity() calls fileDecrypt(cipherIV,
+                            // driveKey, data) — NOT driveDecrypt().  Both functions use identical
+                            // AES-256-GCM logic internally, but driveDecrypt() THROWS on auth-tag
+                            // failure while fileDecrypt() swallows the error and returns the
+                            // 'Error' sentinel string.  Using driveDecrypt() here caused any
+                            // folder with a subtly malformed IV to abort the entire sync rather
+                            // than be handled gracefully.  We mirror the official library exactly.
+                            decryptedBuffer = Buffer.from(await fileDecrypt(cipherIv, driveKey, rawData));
+                            if (decryptedBuffer.toString('ascii') === 'Error') {
+                                throw new Error('fileDecrypt returned Error sentinel for folder/drive (wrong key or corrupted data)');
+                            }
                         }
                         parsedMeta = JSON.parse(decryptedBuffer.toString('utf8'));
                     } catch (e) {
-                        // Corrupted ciphertext or wrong key — PERMANENT.
-                        // Advance cursor so we don't get stuck.
-                        console.warn(`Failed to decrypt metadata for ${txId} (likely corrupted or wrong key). Skipping: ${e}`);
+                        // Decryption failed — skip regardless of entity type.
+                        // We do not insert placeholder records: a bogus name in the
+                        // DB is worse than a missing entry because it can mislead
+                        // downstream commands (ls, download) into believing the
+                        // entity is known and valid.
+                        console.warn(`[SKIP] tx=${txId} entityType=${entityType} entityId=${entityId} reason=decrypt_failed error=${e}`);
+                        totalSkipped++;
                         cursor = edge.cursor;
                         await db.setConfig('last_cursor', cursor);
                         continue;
@@ -244,7 +272,8 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 }
             } catch (parseErr: any) {
                 // JSON.parse failed on a public transaction — PERMANENT (malformed data).
-                console.warn(`Permanent error: Malformed JSON payload for tx ${txId}. Skipping.`);
+                console.warn(`[SKIP] tx=${txId} entityType=${entityType} entityId=${entityId} reason=json_parse_failed error=${parseErr.message}`);
+                totalSkipped++;
                 cursor = edge.cursor;
                 await db.setConfig('last_cursor', cursor);
                 continue;
@@ -263,13 +292,17 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 unix_time: unixTime
             });
 
+            if (debug) {
+                console.log(`[DEBUG OK] entityId=${entityId} entityType=${entityType} name="${parsedMeta.name ?? ''}" tx=${txId}`);
+            }
+
             totalFetched++;
             cursor = edge.cursor;
             await db.setConfig('last_cursor', cursor);
         }
 
-        console.log(`Synced ${totalFetched} entities so far...`);
+        console.log(`Synced ${totalFetched} entities so far (${totalSkipped} skipped)...`);
     }
 
-    console.log(`Sync complete! ${totalFetched} new/updated entities processed.`);
+    console.log(`Sync complete! ${totalFetched} new/updated entities processed, ${totalSkipped} skipped.`);
 }

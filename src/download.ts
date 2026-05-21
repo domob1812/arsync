@@ -3,31 +3,16 @@ import path from 'path';
 import crypto from 'crypto';
 import { SyncDB } from './db';
 import { findProjectRoot, setupDriveKey } from './utils';
-import { JWKWallet, deriveFileKey, fileDecrypt, GatewayAPI, buildQuery } from 'ardrive-core-js';
-
-// Same two-gateway pattern as sync.ts:
-//
-// - gqlGateway: Goldsky GraphQL indexer.
-//               Used to reliably look up transaction tags by ID (including
-//               for ANS-104 bundled data items where /tx/{txId} would fail).
-//
-// - dataGateway: arweave.net full gateway.
-//                Used to fetch raw file data payloads via getTxData(),
-//                which uses the root-path endpoint supporting both L1 and
-//                ANS-104 bundled items, with retries and ArFSMetadataCache.
-
-const gqlGateway = new GatewayAPI({
-    gatewayUrl: new URL('https://arweave-search.goldsky.com/'),
-});
-
-const dataGateway = new GatewayAPI({
-    gatewayUrl: new URL('https://arweave.net/'),
-});
+import { JWKWallet, deriveFileKey, fileDecrypt, buildQuery } from 'ardrive-core-js';
+import { gqlGateway, dataGateway } from './gateways';
 
 /**
  * Fetches the tags for a given transaction ID via GQL.
- * This is the safe way to retrieve tags for any transaction, including
- * ANS-104 bundled data items, since /tx/{txId} can return 404 for those.
+ *
+ * We use GQL (not /tx/{txId}) because the latter returns 404 for ANS-104
+ * bundled data items that have not yet been indexed at the base layer.
+ * The shared gqlGateway (arweave.net) has authoritative coverage of both
+ * L1 transactions and bundled data items.
  */
 async function getTagsForTxId(txId: string): Promise<{ name: string; value: string }[]> {
     const query = buildQuery({ tags: [], ids: [txId as any] });
@@ -67,9 +52,6 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
     if (walletPath) {
         const jwk = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
         wallet = new JWKWallet(jwk);
-        // Note: we do NOT construct arDrive here. setupDriveKey constructs
-        // its own arDriveFactory instance internally, pointed at Goldsky.
-        // The unused `arDrive` variable that was here before has been removed.
     }
 
     // Resolve local path to ArDrive entity
@@ -124,6 +106,7 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
 
     let downloadedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
 
     for (const item of itemsToDownload) {
         const localFullPath = path.join(projectRoot, item.relPath);
@@ -141,7 +124,7 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
         }
 
         if (!entity.data_tx_id) {
-            console.warn(`Skipping ${item.relPath} (no data_tx_id found in local DB. Sync might be incomplete or corrupted).`);
+            console.warn(`Skipping ${item.relPath} (no data_tx_id in local DB — sync may be incomplete).`);
             skippedCount++;
             continue;
         }
@@ -157,8 +140,8 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
             const metaCipherIv = getMetaTag('Cipher-IV');
 
             // Fetch the actual file data payload.
-            // getTxData() uses the root-path endpoint (arweave.net/{txId}) which correctly
-            // handles both L1 and ANS-104 bundled data items, with retries and disk cache.
+            // getTxData() uses the root-path endpoint which correctly handles
+            // both L1 and ANS-104 bundled data items, with retries and disk cache.
             let buffer = await dataGateway.getTxData(entity.data_tx_id as any);
 
             if (metaCipherIv) {
@@ -174,31 +157,57 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
                 // The data transaction has its OWN Cipher-IV, separate from the
                 // metadata transaction's Cipher-IV. Fetch it via GQL as well.
                 const dataTags = await getTagsForTxId(entity.data_tx_id);
-                const dataCipherIv = dataTags.find(t => t.name === 'Cipher-IV')?.value;
+                const getDataTag = (name: string) => dataTags.find(t => t.name === name)?.value;
 
-                if (!dataCipherIv) {
-                    throw new Error('Data transaction is missing Cipher-IV tag');
+                // Apply the same space→+ correction as sync.ts: early ArDrive clients
+                // stored base64 Cipher-IV values where '+' was corrupted to ' ' in GQL.
+                const rawDataCipherIv = getDataTag('Cipher-IV');
+                if (!rawDataCipherIv) {
+                    throw new Error('Data transaction is missing Cipher-IV tag.');
                 }
+                const dataCipherIv = rawDataCipherIv.replace(/ /g, '+');
 
                 // Derive the file-specific key and decrypt.
                 const fileKey = await deriveFileKey(entity.entity_id, driveKey);
-                buffer = Buffer.from(await fileDecrypt(dataCipherIv, fileKey, buffer));
+                const decrypted = Buffer.from(await fileDecrypt(dataCipherIv, fileKey, buffer));
+
+                // fileDecrypt() swallows crypto errors and returns Buffer('Error')
+                // instead of throwing.  Detect the sentinel explicitly so we never
+                // write garbage to disk.
+                if (decrypted.toString('ascii') === 'Error') {
+                    throw new Error('fileDecrypt returned Error sentinel — wrong key or corrupted ciphertext.');
+                }
+
+                buffer = decrypted;
             }
 
             // Write decrypted (or plain) file to disk.
             fs.writeFileSync(localFullPath, buffer);
 
             // Compute SHA256 hash and record sync state in the database.
-            // This is the baseline for future change detection (see design notes).
             const hash = crypto.createHash('sha256').update(buffer).digest('hex');
             const stats = fs.statSync(localFullPath);
-
             await db.updateSyncState(entity.entity_id, hash, stats.mtimeMs, stats.size);
+
             downloadedCount++;
         } catch (err: any) {
             console.error(`Failed to download ${item.relPath}: ${err.message}`);
+
+            // Remove any partially-written file so that the next run retries it
+            // instead of silently skipping it because the file exists on disk.
+            if (fs.existsSync(localFullPath)) {
+                try {
+                    fs.unlinkSync(localFullPath);
+                } catch {
+                    // If we can't remove it, log a clear warning so the user knows
+                    // the file on disk is invalid and must be removed manually.
+                    console.error(`  Warning: could not remove partial file at ${localFullPath} — delete it manually before retrying.`);
+                }
+            }
+
+            failedCount++;
         }
     }
 
-    console.log(`Download complete. Downloaded: ${downloadedCount}, Skipped (already exist): ${skippedCount}.`);
+    console.log(`Download complete. Downloaded: ${downloadedCount}, Skipped: ${skippedCount}, Failed: ${failedCount}.`);
 }
