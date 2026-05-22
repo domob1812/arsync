@@ -36,9 +36,13 @@ export class SyncDB {
                 size INTEGER,
                 last_modified INTEGER,
                 metadata_tx_id TEXT NOT NULL,
-                
+
+                -- Ordering fields: block_height is the canonical ArFS revision
+                -- ordering key; unix_time is the tie-breaker for two revisions
+                -- that land in the same block (per the ArFS spec).
+                block_height INTEGER NOT NULL DEFAULT 0,
                 unix_time INTEGER NOT NULL DEFAULT 0,
-                
+
                 synced_local_sha256 TEXT,
                 synced_local_mtime INTEGER,
                 synced_local_size INTEGER
@@ -62,12 +66,12 @@ export class SyncDB {
     public async upsertEntity(entity: {
         entity_id: string, type: string, name: string, parent_folder_id: string | null,
         data_tx_id: string | null, size: number | null, last_modified: number | null, metadata_tx_id: string,
-        unix_time: number
+        block_height: number, unix_time: number
     }) {
         const db = await this.dbPromise;
         await db.run(`
-            INSERT INTO entities (entity_id, type, name, parent_folder_id, data_tx_id, size, last_modified, metadata_tx_id, unix_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO entities (entity_id, type, name, parent_folder_id, data_tx_id, size, last_modified, metadata_tx_id, block_height, unix_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(entity_id) DO UPDATE SET
                 name = excluded.name,
                 parent_folder_id = excluded.parent_folder_id,
@@ -75,11 +79,14 @@ export class SyncDB {
                 size = excluded.size,
                 last_modified = excluded.last_modified,
                 metadata_tx_id = excluded.metadata_tx_id,
+                block_height = excluded.block_height,
                 unix_time = excluded.unix_time
-            WHERE excluded.unix_time >= entities.unix_time
+            WHERE excluded.block_height > entities.block_height
+               OR (excluded.block_height = entities.block_height AND excluded.unix_time >= entities.unix_time)
         `, [
             entity.entity_id, entity.type, entity.name, entity.parent_folder_id,
-            entity.data_tx_id, entity.size, entity.last_modified, entity.metadata_tx_id, entity.unix_time
+            entity.data_tx_id, entity.size, entity.last_modified, entity.metadata_tx_id,
+            entity.block_height, entity.unix_time
         ]);
     }
 

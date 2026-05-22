@@ -329,6 +329,11 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 size: parsedMeta.size || null,
                 last_modified: parsedMeta.lastModifiedDate || null,
                 metadata_tx_id: txId,
+                // blockHeight is null for pending (unconfirmed) transactions.
+                // We default to 0 so the upsert WHERE condition treats them as
+                // the lowest possible priority; a confirmed revision in any
+                // real block will always win over a pending one.
+                block_height: blockHeight ?? 0,
                 unix_time: unixTime
             });
 
