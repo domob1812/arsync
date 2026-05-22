@@ -2,123 +2,123 @@ import fs from 'fs';
 import path from 'path';
 import { SyncDB } from './db';
 import { findProjectRoot } from './utils';
+import {
+    EntityStatus,
+    computeFileStatus,
+    computeFolderStatus,
+    statusIcon,
+    displayName,
+} from './status';
 
-const COLORS = {
-    reset: '\x1b[0m',
-    blue: '\x1b[1;34m',
-    green: '\x1b[32m',
-    cyan: '\x1b[36m',
-    yellow: '\x1b[33m',
-    bold: '\x1b[1m'
-};
+const YELLOW = '\x1b[33m';
+const RESET = '\x1b[0m';
 
 export async function runLs(targetPath: string) {
     const cwd = process.cwd();
     const resolvedPath = path.resolve(cwd, targetPath);
-    
+
     const projectRoot = findProjectRoot(cwd);
     if (!projectRoot) {
-        console.error("Error: Not inside an arsync project.");
+        console.error('Error: Not inside an arsync project.');
         process.exit(1);
     }
-    
+
     const relativePath = path.relative(projectRoot, resolvedPath);
     if (relativePath.startsWith('..')) {
-        console.error("Error: Path is outside the arsync project.");
+        console.error('Error: Path is outside the arsync project.');
         process.exit(1);
     }
-    
+
     const db = new SyncDB(projectRoot);
     const driveId = await db.getConfig('drive_id');
     if (!driveId) {
-        console.error("Error: Project not fully checked out (missing drive_id in db).");
+        console.error('Error: Project not fully checked out (missing drive_id in db).');
         process.exit(1);
     }
-    
+
+    // -----------------------------------------------------------------------
+    // Resolve the ArFS folder path
+    // -----------------------------------------------------------------------
     let currentFolderId = await db.getRootFolderId(driveId);
-    
+    let currentFolderPath = projectRoot;   // filesystem path of current folder
+
     const parts = relativePath.split(path.sep).filter(p => p.length > 0);
     for (const part of parts) {
         if (!currentFolderId) break;
-        currentFolderId = await db.getChildFolderByName(currentFolderId, part);
+        const childId = await db.getChildFolderByName(currentFolderId, part);
+        if (!childId) {
+            console.error(`Error: Folder '${part}' not found in ArDrive.`);
+            process.exit(1);
+        }
+        currentFolderId = childId;
+        currentFolderPath = path.join(currentFolderPath, part);
     }
-    
-    const dbItems = new Map<string, any>();
-    if (currentFolderId) {
-        const rows = await db.getChildren(currentFolderId);
-        for (const row of rows) {
-            dbItems.set(row.name, row);
+
+    if (!currentFolderId) {
+        console.error('Error: Could not resolve ArFS folder path.');
+        process.exit(1);
+    }
+
+    // -----------------------------------------------------------------------
+    // List children and compute statuses
+    // -----------------------------------------------------------------------
+    const children = await db.getChildren(currentFolderId);
+
+    interface ListEntry {
+        name: string;
+        type: string;
+        status: EntityStatus;
+    }
+
+    const results: ListEntry[] = [];
+
+    for (const child of children) {
+        const childPath = path.join(currentFolderPath, child.name);
+
+        if (child.type === 'file') {
+            const st = await computeFileStatus(db, child, childPath);
+            results.push({ name: child.name, type: 'file', status: st });
+        } else {
+            const st = await computeFolderStatus(db, child, childPath);
+            results.push({ name: child.name, type: 'folder', status: st });
         }
     }
-    
-    const localItems = new Map<string, { type: string }>();
-    if (fs.existsSync(resolvedPath)) {
-        const stats = fs.statSync(resolvedPath);
-        if (stats.isDirectory()) {
-            const files = fs.readdirSync(resolvedPath, { withFileTypes: true });
-            for (const file of files) {
-                if (file.name === '.arsync') continue;
-                localItems.set(file.name, {
-                    type: file.isDirectory() ? 'folder' : 'file'
-                });
+
+    // -----------------------------------------------------------------------
+    // Detect extra local files (not in DB)
+    // -----------------------------------------------------------------------
+    if (fs.existsSync(currentFolderPath)) {
+        const dbNames = new Set(children.map((c: any) => c.name));
+        const localEntries = fs.readdirSync(currentFolderPath, { withFileTypes: true });
+        for (const entry of localEntries) {
+            if (entry.name === '.arsync') continue;
+            if (!dbNames.has(entry.name)) {
+                const entryType = entry.isDirectory() ? 'folder' : 'file';
+                results.push({ name: entry.name, type: entryType, status: 'orange' });
             }
         }
     }
-    
-    const combined = new Map<string, { name: string, type: string, state: string }>();
-    
-    // Add remote items (and check if they are also local)
-    for (const [name, dbItem] of dbItems.entries()) {
-        combined.set(name, {
-            name,
-            type: dbItem.type,
-            state: localItems.has(name) ? 'both' : 'remote'
-        });
-    }
-    
-    // Add items that are strictly local
-    for (const [name, localItem] of localItems.entries()) {
-        if (!combined.has(name)) {
-            combined.set(name, {
-                name,
-                type: localItem.type,
-                state: 'local'
-            });
-        }
-    }
-    
-    const items = Array.from(combined.values());
-    
+
+    // -----------------------------------------------------------------------
     // Sort: directories first, then alphabetically
-    items.sort((a, b) => {
+    // -----------------------------------------------------------------------
+    results.sort((a, b) => {
         if (a.type === 'folder' && b.type !== 'folder') return -1;
         if (a.type !== 'folder' && b.type === 'folder') return 1;
         return a.name.localeCompare(b.name);
     });
-    
-    for (const item of items) {
-        let stateIcon = '';
-        if (item.state === 'both') {
-            stateIcon = `${COLORS.green}[✓]${COLORS.reset}`;
-        } else if (item.state === 'remote') {
-            stateIcon = `${COLORS.cyan}[↓]${COLORS.reset}`;
-        } else if (item.state === 'local') {
-            stateIcon = `${COLORS.yellow}[↑]${COLORS.reset}`;
-        }
-        
-        let displayName = item.name;
-        if (item.type === 'folder') {
-            displayName = `${COLORS.blue}${COLORS.bold}${item.name}/${COLORS.reset}`;
-        }
-        
-        console.log(`${stateIcon} ${displayName}`);
+
+    // -----------------------------------------------------------------------
+    // Print
+    // -----------------------------------------------------------------------
+    for (const item of results) {
+        console.log(`${statusIcon(item.status)} ${displayName(item.name, item.type)}`);
     }
 
-    // Warn about orphaned entities that are in the database but invisible
-    // to tree-walking because their parent folder's metadata fetch failed.
+    // Warn about orphaned entities
     const orphanCount = await db.countOrphanedEntities(driveId);
     if (orphanCount > 0) {
-        console.log(`\n${COLORS.yellow}Warning: ${orphanCount} entity/entities in the database have unresolved parent folders and are not shown above.${COLORS.reset}`);
-        console.log(`${COLORS.yellow}         Run \`arsync retry-skipped\` to attempt recovery.${COLORS.reset}`);
+        console.log(`\n${YELLOW}Warning: ${orphanCount} entity/entities in the database have unresolved parent folders and are not shown above.${RESET}`);
+        console.log(`${YELLOW}         Run \`arsync retry-skipped\` to attempt recovery.${RESET}`);
     }
 }

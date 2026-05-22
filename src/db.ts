@@ -45,7 +45,8 @@ export class SyncDB {
 
                 synced_local_sha256 TEXT,
                 synced_local_mtime INTEGER,
-                synced_local_size INTEGER
+                synced_local_size INTEGER,
+                downloaded_data_tx_id TEXT
             );
 
             -- Tracks metadata transactions whose payload could not be fetched.
@@ -185,11 +186,24 @@ export class SyncDB {
         return row ? row.cnt : 0;
     }
 
-    public async updateSyncState(entityId: string, sha256: string, mtime: number, size: number) {
+    public async updateSyncState(entityId: string, sha256: string, mtime: number, size: number, downloadedDataTxId?: string) {
         const db = await this.dbPromise;
         await db.run(
-            'UPDATE entities SET synced_local_sha256 = ?, synced_local_mtime = ?, synced_local_size = ? WHERE entity_id = ?',
-            sha256, Math.floor(mtime), size, entityId
+            'UPDATE entities SET synced_local_sha256 = ?, synced_local_mtime = ?, synced_local_size = ?, downloaded_data_tx_id = ? WHERE entity_id = ?',
+            sha256, Math.floor(mtime), size, downloadedDataTxId ?? null, entityId
+        );
+    }
+
+    /**
+     * Update only the local mtime/size after a quick-check confirms the file
+     * hash still matches (the file was touched but content is unchanged).
+     * This avoids re-hashing the same file on every `arsync ls`.
+     */
+    public async updateLocalMtime(entityId: string, mtime: number, size: number) {
+        const db = await this.dbPromise;
+        await db.run(
+            'UPDATE entities SET synced_local_mtime = ?, synced_local_size = ? WHERE entity_id = ?',
+            Math.floor(mtime), size, entityId
         );
     }
 

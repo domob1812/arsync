@@ -193,9 +193,10 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
             fs.writeFileSync(localFullPath, buffer);
 
             // Compute SHA256 hash and record sync state in the database.
+            // Store the data_tx_id so we can later detect cloud-side changes.
             const hash = crypto.createHash('sha256').update(buffer).digest('hex');
             const stats = fs.statSync(localFullPath);
-            await db.updateSyncState(entity.entity_id, hash, stats.mtimeMs, stats.size);
+            await db.updateSyncState(entity.entity_id, hash, stats.mtimeMs, stats.size, entity.data_tx_id);
 
             downloadedCount++;
         } catch (err: any) {
