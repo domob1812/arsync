@@ -102,6 +102,14 @@ export async function runDownload(targetPath: string, askPassword: () => Promise
 
     await collectItems(currentId, currentType, relativePath);
 
+    // Warn about orphaned entities before starting the download so the user
+    // knows upfront that some items are invisible to this run.
+    const orphanCount = await db.countOrphanedEntities(driveId);
+    if (orphanCount > 0) {
+        console.warn(`Warning: ${orphanCount} entity/entities in the database have unresolved parent folders and will NOT be downloaded.`);
+        console.warn(`         Run \`arsync retry-skipped\` to attempt recovery, then re-run download.`);
+    }
+
     console.log(`Found ${itemsToDownload.length} item(s) in ArDrive subtree.`);
 
     let downloadedCount = 0;

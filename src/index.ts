@@ -6,6 +6,7 @@ import { runSync } from './sync';
 import { runLs } from './ls';
 import { runDownload } from './download';
 import { runDiagnose } from './diagnose';
+import { runRetrySkipped } from './retry_skipped';
 import { findProjectRoot } from './utils';
 import inquirer from 'inquirer';
 import path from 'path';
@@ -76,6 +77,33 @@ program
         });
     } catch (err: any) {
         console.error('Error during download:', err.message);
+    }
+  });
+
+program
+  .command('retry-skipped')
+  .description('Retry all previously-failed metadata transaction fetches')
+  .argument('[dir]', 'Project directory containing the .arsync folder (default: current)', '.')
+  .action(async (dir) => {
+    const projectPath = path.resolve(dir);
+    const root = findProjectRoot(projectPath);
+    if (!root) {
+        console.error(`No .arsync project found at or above: ${projectPath}`);
+        process.exit(1);
+    }
+    const db = new SyncDB(root);
+    try {
+        await runRetrySkipped(db, async () => {
+            const answers = await inquirer.prompt([{
+                type: 'password',
+                name: 'password',
+                message: 'Enter ArDrive password for private drive:'
+            }]);
+            return answers.password;
+        });
+    } catch (err: any) {
+        console.error('Error during retry-skipped:', err.message);
+        process.exit(1);
     }
   });
 

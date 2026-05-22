@@ -113,4 +113,12 @@ export async function runLs(targetPath: string) {
         
         console.log(`${stateIcon} ${displayName}`);
     }
+
+    // Warn about orphaned entities that are in the database but invisible
+    // to tree-walking because their parent folder's metadata fetch failed.
+    const orphanCount = await db.countOrphanedEntities(driveId);
+    if (orphanCount > 0) {
+        console.log(`\n${COLORS.yellow}Warning: ${orphanCount} entity/entities in the database have unresolved parent folders and are not shown above.${COLORS.reset}`);
+        console.log(`${COLORS.yellow}         Run \`arsync retry-skipped\` to attempt recovery.${COLORS.reset}`);
+    }
 }

@@ -5,6 +5,53 @@ import { fileDecrypt, deriveFileKey, JWKWallet, ASCENDING_ORDER } from 'ardrive-
 import { setupDriveKey } from './utils';
 import { gqlGateway, dataGateway } from './gateways';
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * After this many consecutive transient failures for the same transaction,
+ * the entry is demoted from 'transient' to 'missing'.  This prevents a
+ * single broken-but-indexed transaction from blocking every future sync run.
+ */
+const MAX_TRANSIENT_RETRIES = 5;
+
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify a data-fetch error into 'transient' or 'missing' and extract the
+ * HTTP status code when available.
+ *
+ * Rule of thumb:
+ *   HTTP 404           → 'missing'  (gateway definitively has no data)
+ *   HTTP 4xx (other)   → 'missing'  (client error — retrying won't help)
+ *   HTTP 5xx           → 'transient' (server error — may recover)
+ *   Network / timeout  → 'transient' (connectivity issue — may recover)
+ */
+function classifyFetchError(err: any): { failType: 'transient' | 'missing'; httpStatus: number | null } {
+    // Axios wraps HTTP errors in err.response; some libraries surface err.status
+    // directly.  Fall back to null if neither is present (pure network error).
+    const status: number | null =
+        err?.response?.status ??
+        err?.status ??
+        null;
+
+    if (status === 404) {
+        return { failType: 'missing', httpStatus: 404 };
+    }
+
+    if (status !== null && status >= 400 && status < 500) {
+        // Other 4xx errors (403 Forbidden, 410 Gone, etc.) are also definitive:
+        // the gateway understood the request and deliberately refused/cannot serve it.
+        return { failType: 'missing', httpStatus: status };
+    }
+
+    // 5xx errors or pure network failures are treated as transient.
+    return { failType: 'transient', httpStatus: status };
+}
+
 export async function runSync(db: SyncDB, askPassword: () => Promise<string | null>, debug = false) {
     const driveId = await db.getConfig('drive_id');
     let walletPath = await db.getConfig('wallet_path');
@@ -103,6 +150,22 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
         const jwk = JSON.parse(readFileSync(walletPath, 'utf8'));
         const wallet = new JWKWallet(jwk);
         driveKey = await setupDriveKey(wallet, driveId, askPassword);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-flight: report any previously-recorded fetch failures
+    // -----------------------------------------------------------------------
+    //
+    // We surface the count of known-failed transactions before starting the
+    // main GQL walk so the user can see the state up-front.  Automatic retry
+    // during `update` is intentionally NOT done here — run `arsync retry-skipped`
+    // to explicitly retry them.
+
+    const failCounts = await db.countFailedFetches();
+    const totalFailed = failCounts.transient + failCounts.missing;
+    if (totalFailed > 0) {
+        console.log(`Note: ${totalFailed} previously-failed transaction(s) are recorded in the database.`);
+        console.log('  Run "arsync retry-skipped" to attempt recovery.\n');
     }
 
     // -----------------------------------------------------------------------
@@ -260,11 +323,43 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
                 // already fetched once are served locally with no network I/O.
                 rawData = await dataGateway.getTxData(txId as any);
             } catch (dataErr: any) {
-                // Transient network/gateway failure.  Abort without advancing the
-                // cursor so the next run retries this transaction.
-                console.error(`\n[ABORT] Transient error fetching payload for tx=${txId} entityType=${entityType} entityId=${entityId}`);
-                console.error(`Error details: ${dataErr.message}`);
-                throw dataErr;
+                // The payload fetch failed.  Classify the error, record it in
+                // failed_fetches, advance the cursor past this transaction, and
+                // continue.  This keeps the sync moving even when a single
+                // gateway permanently lacks data for a specific transaction.
+                //
+                // The cursor IS advanced here (unlike a hard abort) so that
+                // repeated runs don't re-attempt this transaction indefinitely
+                // during the normal GQL walk.  Use `arsync retry-skipped` to
+                // explicitly retry recorded failures.
+                const { failType, httpStatus } = classifyFetchError(dataErr);
+                const existingRow = await db.getFailedFetches('all').then(
+                    rows => rows.find(r => r.metadata_tx_id === txId)
+                );
+                const retryCount = existingRow ? existingRow.retry_count + 1 : 0;
+
+                console.warn(`\n[SKIP] tx=${txId} entityType=${entityType ?? '?'} entityId=${entityId} reason=fetch_failed http=${httpStatus ?? 'none'} retries=${retryCount} error=${dataErr.message}`);
+
+                await db.recordFailedFetch({
+                    metadata_tx_id:   txId,
+                    entity_id:        entityId,
+                    entity_type:      entityType ?? null,
+                    block_height:     blockHeight,
+                    unix_time:        unixTime,
+                    parent_folder_id: parentFolderId,
+                    gql_cursor:       edge.cursor,
+                    fail_type:        failType,
+                    http_status:      httpStatus,
+                    error_message:    dataErr.message ?? String(dataErr)
+                });
+
+                totalSkipped++;
+                cursor = edge.cursor;
+                await db.setConfig('last_cursor', cursor);
+                if (blockHeight !== null && (batchMaxHeight === null || blockHeight > batchMaxHeight)) {
+                    batchMaxHeight = blockHeight;
+                }
+                continue;
             }
 
             // ------------------------------------------------------------------
@@ -373,5 +468,12 @@ export async function runSync(db: SyncDB, askPassword: () => Promise<string | nu
     // starts fresh (relying solely on the block height filter).
     await db.setConfig('last_cursor', '');
 
+    // Print a final summary of any fetch failures accumulated across all runs.
+    const finalFailCounts = await db.countFailedFetches();
+    const finalTotalFailed = finalFailCounts.transient + finalFailCounts.missing;
     console.log(`Sync complete! ${totalFetched} new/updated entities processed, ${totalSkipped} skipped.`);
+    if (finalTotalFailed > 0) {
+        console.log(`\nNote: ${finalTotalFailed} transaction(s) have recorded fetch failures (cumulative across all runs).`);
+        console.log('  Run "arsync retry-skipped" to attempt recovery.');
+    }
 }
